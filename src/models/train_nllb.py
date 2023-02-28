@@ -14,8 +14,8 @@ from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 from src.paths import ROOT_DIR, MODELS_DIR
 from src.util import load_dataset
-from src.models import Transformer
-from src.models.dataset import AfriSentDataset, collate_fn
+from src.models import Transformer, NLLB_Encoder
+from src.models.dataset import AfriSentDataset, NLLBAfriSentDataset, collate_fn, nllb_collate_fn
 from sklearn.utils.class_weight import compute_class_weight
 
 
@@ -29,7 +29,7 @@ def parse_training_args():
     parser.add_argument("--checkpoint_steps", type=int, default=2500)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--gradient_accumulations", type=int, default=1)
-    parser.add_argument("--tokenizer_max_length", type=int, default=128)
+    parser.add_argument("--tokenizer_max_length", type=int, default=64)
     parser.add_argument("--model_type", type=str, default="xlm-roberta-large")
     parser.add_argument("--num_labels", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-6)
@@ -44,6 +44,7 @@ def parse_training_args():
     parser.add_argument("--remove_handles_urls", action="store_true")
     parser.add_argument("--validation_percent", type=float, default=0.1)
     parser.add_argument("--dev_as_validation", action="store_true")
+    parser.add_argument("--use_cls_token", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -59,6 +60,12 @@ def train(args):
         verbose=True,
     )        
     tokenizer = AutoTokenizer.from_pretrained(args.model_type)
+    # Some of the examples in these sets have particularly long tokenizations, so we set hard limit.
+    if args.lang_id == "kr":
+        args.tokenizer_max_length = 32
+    if args.lang_id == "ma":
+        args.batch_size = 16
+        args.gradient_accumulatons = 2
     if args.checkpoint:
         state_dict = torch.load(args.checkpoint, map_location=torch.device("cpu"))["state_dict"]
         if "model.loss_fct.weight" in state_dict:
@@ -82,19 +89,18 @@ def train(args):
             train_data = train_data[:-valid_size]
         if args.sst_file:
             train_data += load_dataset(args.sst_file, en_tweets=True if args.lang_id == "en" else False)
-        train_dataset = AfriSentDataset(train_data, remove_handles_urls=args.remove_handles_urls)
-        valid_dataset = AfriSentDataset(valid_data, remove_handles_urls=args.remove_handles_urls)
-        partial_collate_fn = partial(collate_fn, tokenizer=tokenizer, max_length=args.tokenizer_max_length)
+        train_dataset = NLLBAfriSentDataset(train_data, args.lang_id, args.model_type, remove_handles_urls=args.remove_handles_urls, use_cls_token=args.use_cls_token)
+        valid_dataset = NLLBAfriSentDataset(valid_data, args.lang_id, args.model_type, remove_handles_urls=args.remove_handles_urls, use_cls_token=args.use_cls_token)
+        partial_collate_fn = partial(nllb_collate_fn, tokenizer=tokenizer, max_length=args.tokenizer_max_length)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=partial_collate_fn, shuffle=True)
         valid_dataloader = DataLoader(valid_dataset, batch_size=2*args.batch_size, num_workers=1, collate_fn=partial_collate_fn)
         steps_per_epoch = math.ceil((len(train_dataset) / args.batch_size) / args.gradient_accumulations)
         if args.normalize_class_dist:
             class_weights = compute_class_weight(class_weight="balanced", classes=np.array([0, 1, 2]), y=train_dataset.data_labels)
-            print(class_weights)
         else:
             class_weights = [1, 1, 1]
         loss_fct_params = {"label_smoothing": args.label_smoothing, "weight": torch.tensor(class_weights).float()}
-        model = Transformer(args.model_type, steps_per_epoch=steps_per_epoch, epochs=args.epochs, lr=args.lr, loss_fct_params=loss_fct_params)
+        model = NLLB_Encoder(args.model_type, tokenizer, steps_per_epoch=steps_per_epoch, epochs=args.epochs, lr=args.lr, loss_fct_params=loss_fct_params)
         if args.checkpoint:
             model.load_state_dict(state_dict, strict=False)
         trainer = pl.Trainer(gpus=1, max_epochs=args.epochs, default_root_dir="checkpoints", precision="bf16",

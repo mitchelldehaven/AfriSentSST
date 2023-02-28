@@ -14,8 +14,8 @@ from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 from src.paths import ROOT_DIR, MODELS_DIR, OUTPUTS_DIR
 from src.util import load_dataset, to_cuda_hf, dump_predictions
-from src.models import Transformer
-from src.models.dataset import AfriSentDataset, collate_fn
+from src.models import Transformer, NLLB_Encoder
+from src.models.dataset import AfriSentDataset, NLLBAfriSentDataset, collate_fn, nllb_collate_fn
 import src.util as utils
 import pandas as pd
 from tqdm import tqdm
@@ -31,14 +31,15 @@ def parse_inference_args():
     parser.add_argument("--lang_id", type=str, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--dataset", type=str, default="dev")
-    parser.add_argument("--multi", action="store_true")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--tokenizer_max_length", type=int, default=128)
-    parser.add_argument("--model_type", type=str, default="xlm-roberta-large")
+    parser.add_argument("--tokenizer_max_length", type=int, default=64)
+    parser.add_argument("--model_type", type=str, default="facebook/nllb-200-distilled-1.3B")
     parser.add_argument("--random_seed", type=int, default=0)
     parser.add_argument("--output_dir", type=Path, default=OUTPUTS_DIR)
     parser.add_argument("--remove_handles_urls", action="store_true")
+    parser.add_argument("--use_cls_token", action="store_true")
     parser.add_argument("--subtask_dir", type=str, default="SubtaskA")
+    parser.add_argument("--keep_tweets", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -48,7 +49,7 @@ def evaluate(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_type)
     # if args.multi:
     #     init_lang_tokens(tokenizer)
-    model = Transformer(args.model_type, tokenizer)
+    model = NLLB_Encoder(args.model_type, tokenizer)
     state_dict = torch.load(args.checkpoint)["state_dict"]
     if "model.loss_fct.weight" in state_dict:
         del state_dict["model.loss_fct.weight"]
@@ -63,22 +64,21 @@ def evaluate(args):
     output_file = args.output_dir / f"pred_{args.lang_id}.tsv"
     dev_pd = pd.read_csv(dev_file, sep="\t")
     dev_data = load_dataset(dev_file)
-    use_lang_id = args.lang_id if args.multi else None
-    dev_dataset = AfriSentDataset(dev_data, remove_handles_urls=True)
+    dev_dataset = NLLBAfriSentDataset(dev_data, args.lang_id, args.model_type, remove_handles_urls=True, use_cls_token=args.use_cls_token)
     id2label = {v: k for k, v in dev_dataset.label2id.items()}
-    partial_collate_fn = partial(collate_fn, tokenizer=tokenizer, max_length=args.tokenizer_max_length)
+    partial_collate_fn = partial(nllb_collate_fn, tokenizer=tokenizer, max_length=args.tokenizer_max_length)
     dev_dataloader = DataLoader(dev_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=partial_collate_fn)
     predictions = []
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for batch_inputs, batch_labels in tqdm(dev_dataloader):
             to_cuda_hf(batch_inputs)
             batch_outputs = model(batch_inputs)
-            batch_predictions = batch_outputs.logits.argmax(axis=1).detach().cpu()
+            batch_predictions = batch_outputs[0].argmax(axis=1).detach().cpu()
             for pred in batch_predictions:
                 pred_str = id2label[pred.item()]
                 predictions.append(pred_str)
     
-    dump_predictions(dev_file, output_file, predictions)
+    dump_predictions(dev_file, output_file, predictions, keep_tweets=args.keep_tweets)
 
 
 if __name__ == "__main__":

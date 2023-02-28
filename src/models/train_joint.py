@@ -72,7 +72,7 @@ def train(args):
     partial_mlm_collate_fn = partial(masked_lm_collate_fn, tokenizer=tokenizer, max_length=args.tokenizer_max_length, mlm_probability=args.mlm_probability)
     train_mlm_dataset = MaskedLMDataset(args.mlm_train_file, max_samples=100_000)
     valid_mlm_dataset = MaskedLMDataset(args.mlm_train_file, skip_samples=100_000, max_samples=2_000)
-    train_mlm_dataloader = DataLoader(train_mlm_dataset, batch_size=args.batch_size, num_workers=4, collate_fn=partial_mlm_collate_fn, shuffle=True)
+    train_mlm_dataloader = DataLoader(train_mlm_dataset, batch_size=args.batch_size, num_workers=0, collate_fn=partial_mlm_collate_fn, shuffle=True)
     valid_mlm_dataloader = DataLoader(valid_mlm_dataset, batch_size=args.batch_size, num_workers=0, collate_fn=partial_mlm_collate_fn)
 
     steps_per_epoch = math.ceil((len(train_mlm_dataset) / args.batch_size) / args.gradient_accumulations)
